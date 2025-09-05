@@ -1,4 +1,4 @@
-# AWS Deadline Cloud Setup Script
+# Envoi Cloud Render Farm
 
 This bash script automates the end-to-end setup of a basic AWS Deadline Cloud environment. It handles the creation of all necessary resources, including an S3 bucket for storage, a Deadline Cloud farm, IAM roles with correct trust policies, a queue, a service-managed fleet, and the association between the queue and the fleet.
 
@@ -26,18 +26,18 @@ You must modify the **`USER CONFIGURATION`** section of the script to match your
 # The AWS region where resources will be created. Must be a region that supports AWS Deadline Cloud.
 export AWS_REGION="us-east-1"
 # The AWS CLI profile to use for authentication.
-export AWS_PROFILE="kj-aws"
+export AWS_PROFILE="aws-profile"
 # The name for the S3 bucket. Must be globally unique.
-export S3_BUCKET="kj-aws-test-deadline-cloud-storage-bucket"
+export S3_BUCKET="bucket-aws-test-deadline-cloud-storage-bucket"
 # Set to "true" to create a new S3 bucket, or "false" to use an existing one.
 export CREATE_S3_BUCKET="true"
 # A display name for your Deadline Cloud farm.
-export DEADLINE_CLOUD_FARM_NAME="kj-aws-test-my-deadline-farm"
+export DEADLINE_CLOUD_FARM_NAME="bucketname-aws-test-my-deadline-farm"
 # Names for the IAM roles to be created. These should be unique within your account.
-export QUEUE_SERVICE_ROLE_NAME="kj-aws-test-DeadlineCloud-Queue-Service-Role-3"
-export FLEET_SERVICE_ROLE_NAME="kj-aws-test-DeadlineCloud-Fleet-Service-Role-3"
-export MONITOR_USER_ROLE_NAME="kj-aws-test-AWSDeadlineCloudMonitorUserRole-3"
-# A display name for the render fleet.
+export QUEUE_SERVICE_ROLE_NAME="bucketname-aws-test-DeadlineCloud-Queue-Service-Role-3"
+export FLEET_SERVICE_ROLE_NAME="bucketname-aws-test-DeadlineCloud-Fleet-Service-Role-3"
+export MONITOR_USER_ROLE_NAME="bucketname-aws-test-AWSDeadlineCloudMonitorUserRole-3"
+# A display name for the render bucketname.
 export DEADLINE_FLEET_DISPLAY_NAME="my-deadline-fleet"
 # The maximum number of workers for your fleet.
 export MAX_WORKER_COUNT=5
