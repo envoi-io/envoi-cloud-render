@@ -45,3 +45,41 @@ export MAX_WORKER_COUNT=5
 export FLEET_CONFIG_FILE="service-managed-fleet-config.json"
 # The ARN of the IAM entity (user or role) that will be associated with the monitor.
 export PRINCIPAL_ID_ARN="arn:aws:iam::833740154547:user/envoi-services"
+
+
+## Usage
+Save the script: Save the code to a file named setup-deadline-cloud.sh.
+
+Make the script executable:
+
+Bash
+
+chmod +x setup-deadline-cloud.sh
+
+Create the fleet configuration file: Create a file named service-managed-fleet-config.json in the same directory with the following content. This file specifies the desired EC2 instance capabilities for your fleet.
+
+JSON
+
+{
+  "serviceManagedEc2": {
+    "instanceCapabilities": {
+      "vCpuCount": {
+        "min": 1,
+        "max": 8
+      },
+      "memoryMiB": {
+        "min": 1024
+      },
+      "osFamily": "LINUX",
+      "cpuArchitectureType": "x86_64"
+    },
+    "instanceMarketOptions": {
+      "type": "spot"
+    }
+  }
+}
+Run the script: Execute the script from your terminal. It will prompt you with progress messages for each step.
+
+Bash
+
+./setup-deadline-cloud.sh
