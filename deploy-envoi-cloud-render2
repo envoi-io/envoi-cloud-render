@@ -1,0 +1,1096 @@
+#!/bin/bash
+
+# =============================================================================
+# AWS Deadline Cloud Setup Script
+#
+# This script automates the creation of a complete AWS Deadline Cloud environment,
+# including IAM roles, an S3 bucket, a render farm, a queue, a fleet, and the
+# association between the queue and fleet. It also dynamically finds the
+# deadline:PrincipalId for a specified IAM entity.
+#
+# PREREQUISITES:
+# - AWS CLI configured with a profile that has permissions to create IAM roles,
+#   Deadline farms, queues, fleets, and S3 buckets.
+# - jq is installed (used for parsing JSON output from AWS CLI commands).
+# =============================================================================
+
+# Exit on any command failure
+set -e
+
+# =============================================================================
+# USER CONFIGURATION
+# =============================================================================
+export AWS_REGION="us-east-1"
+export AWS_PROFILE="kj-aws"
+export S3_BUCKET="kj-aws-test-deadline-cloud-storage-bucket"
+export CREATE_S3_BUCKET="true"
+export DEADLINE_CLOUD_FARM_NAME="kj-aws-test-my-deadline-farm"
+export QUEUE_SERVICE_ROLE_NAME="kj-aws-test-DeadlineCloud-Queue-Service-Role-3"
+export FLEET_SERVICE_ROLE_NAME="kj-aws-test-DeadlineCloud-Fleet-Service-Role-3"
+export MONITOR_USER_ROLE_NAME="kj-aws-test-AWSDeadlineCloudMonitorUserRole-3"
+export DEADLINE_FLEET_DISPLAY_NAME="my-deadline-fleet"
+export MAX_WORKER_COUNT=5
+export FLEET_CONFIG_FILE="service-managed-fleet-config.json"
+export PRINCIPAL_ID_ARN="arn:aws:iam::833740154547:user/envoi-services"
+
+# =============================================================================
+# DYNAMIC VARIABLES (DO NOT MODIFY)
+# =============================================================================
+export AWS_ACCOUNT_ID=$(aws sts --profile "$AWS_PROFILE" get-caller-identity --output text --query 'Account')
+export QUEUE_ROLE_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:role/$QUEUE_SERVICE_ROLE_NAME"
+export FLEET_ROLE_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:role/$FLEET_SERVICE_ROLE_NAME"
+export MONITOR_ROLE_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:role/$MONITOR_USER_ROLE_NAME"
+export DEADLINE_PRINCIPAL_ID="" # This will be set later
+
+# =============================================================================
+# Helper function to check for errors
+# =============================================================================
+function check_error {
+    if [ $? -ne 0 ]; then
+        echo "ERROR: $1"
+        exit 1
+    fi
+}
+
+# =============================================================================
+# STEP 1: Create S3 Bucket for Job Attachments (if enabled)
+# =============================================================================
+if [ "$CREATE_S3_BUCKET" = "true" ]; then
+    echo "Checking if S3 bucket '$S3_BUCKET' already exists..."
+    if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+        echo "S3 bucket '$S3_BUCKET' already exists. Skipping creation."
+    else
+        echo "S3 bucket '$S3_BUCKET' does not exist. Creating it in region $AWS_REGION..."
+        if [ "$AWS_REGION" = "us-east-1" ]; then
+            aws s3api create-bucket \
+                --bucket "$S3_BUCKET" \
+                --region "$AWS_REGION" > /dev/null
+        else
+            aws s3api create-bucket \
+                --bucket "$S3_BUCKET" \
+                --region "$AWS_REGION" \
+                --create-bucket-configuration "LocationConstraint=$AWS_REGION" > /dev/null
+        fi
+        check_error "Failed to create S3 bucket: $S3_BUCKET"
+        echo "S3 bucket created successfully."
+    fi
+fi
+
+# =============================================================================
+# STEP 2: Create a Deadline Cloud Render Farm
+# =============================================================================
+echo "Creating Deadline Cloud farm: $DEADLINE_CLOUD_FARM_NAME"
+FARM_OUTPUT=$(aws deadline create-farm \
+    --display-name "$DEADLINE_CLOUD_FARM_NAME" \
+    --region "$AWS_REGION" \
+    --profile "$AWS_PROFILE")
+check_error "Failed to create Deadline Cloud farm"
+export DEADLINE_CLOUD_FARM_ID=$(echo "$FARM_OUTPUT" | jq -r '.farmId')
+export DEADLINE_CLOUD_FARM_ARN="arn:aws:deadline:$AWS_REGION:$AWS_ACCOUNT_ID:farm/$DEADLINE_CLOUD_FARM_ID"
+echo "Deadline Cloud farm created with ID: $DEADLINE_CLOUD_FARM_ID and ARN: $DEADLINE_CLOUD_FARM_ARN"
+
+# =============================================================================
+# STEP 3: Create IAM Roles
+# =============================================================================
+echo "Creating IAM Roles for Deadline Cloud..."
+
+# Define common trust policy for Deadline service roles
+
+QUEUE_SERVICE_TRUST_POLICY=$(cat <<EOF
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "DeadlineQueueRoleTemplateCombinedProdTP",
+			"Effect": "Allow",
+			"Principal": {
+				"Service": [
+					"deadline.amazonaws.com",
+					"credentials.deadline.amazonaws.com"
+				]
+			},
+			"Action": "sts:AssumeRole",
+			"Condition": {
+				"StringEquals": {
+					"aws:SourceAccount": "$AWS_ACCOUNT_ID"
+				},
+				"ArnEquals": {
+					"aws:SourceArn": "$DEADLINE_CLOUD_FARM_ARN"
+				}
+			}
+		}
+	]
+}
+EOF
+)
+
+FLEET_SERVICE_TRUST_POLICY=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+  {
+    "Effect": "Allow",
+  "Principal": {
+         "Service": [
+		 "credentials.deadline.amazonaws.com"
+                  	]
+  },
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      "StringEquals": {
+        "aws:SourceAccount": "$AWS_ACCOUNT_ID"
+      },
+      "ArnLike": {
+        "aws:SourceArn": "$DEADLINE_CLOUD_FARM_ARN"
+      }
+    }
+  }
+  ]
+}
+EOF
+)
+
+# Define trust policy for the Monitor User Role
+MONITOR_TRUST_POLICY=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::$AWS_ACCOUNT_ID:root"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+)
+	
+	
+
+
+# Create and attach policy for DeadlineCloud-Queue-Service-Role
+echo "Creating and attaching policy for $QUEUE_SERVICE_ROLE_NAME..."
+aws iam create-role --role-name "$QUEUE_SERVICE_ROLE_NAME" --assume-role-policy-document "$QUEUE_SERVICE_TRUST_POLICY" --output text > /dev/null
+check_error "Failed to create IAM role: $QUEUE_SERVICE_ROLE_NAME"
+
+QUEUE_POLICY=$(cat <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Sid": "DeadlineQueueRoleTemplateCombinedProd1",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket",
+                "s3:GetBucketLocation"
+            ],
+            "Resource": [
+                "arn:aws:s3:::$S3_BUCKET",
+                "arn:aws:s3:::$S3_BUCKET/DeadlineCloud/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceAccount": "$AWS_ACCOUNT_ID"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Sid": "DeadlineQueueRoleTemplateCombinedProd2",
+            "Action": [
+                "logs:GetLogEvents"
+            ],
+            "Resource": "arn:aws:logs:*:*:*:/aws/deadline/*"
+        },
+        {
+            "Effect": "Allow",
+            "Sid": "DeadlineQueueRoleTemplateCombinedProd3",
+            "Action": [
+                "s3:ListBucket",
+                "s3:GetObject"
+            ],
+            "Resource": [
+                "*"
+            ],
+            "Condition": {
+                "ArnLike": {
+                    "s3:DataAccessPointArn": [
+                        "arn:aws:s3:*:*:accesspoint/deadline-software-*"
+                    ]
+                },
+                "StringEquals": {
+                    "s3:AccessPointNetworkOrigin": "VPC"
+                }
+            }
+        }
+    ]
+}
+EOF
+)
+
+aws iam put-role-policy --role-name "$QUEUE_SERVICE_ROLE_NAME" --policy-name "${QUEUE_SERVICE_ROLE_NAME}-Policy" --policy-document "$QUEUE_POLICY" --output text > /dev/null
+check_error "Failed to attach policy to $QUEUE_SERVICE_ROLE_NAME"
+
+# Create and attach policy for DeadlineCloud-Fleet-Service-Role
+echo "Creating and attaching policy for $FLEET_SERVICE_ROLE_NAME..."
+aws iam create-role --role-name "$FLEET_SERVICE_ROLE_NAME" --assume-role-policy-document "$FLEET_SERVICE_TRUST_POLICY" --output text > /dev/null
+check_error "Failed to create IAM role: $FLEET_SERVICE_ROLE_NAME"
+
+FLEET_POLICY=$(cat <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+	
+        {
+            "Effect": "Allow",
+            "Action": [
+				"deadline:AssumeFleetRoleForWorker",
+			    "deadline:UpdateWorker",
+			    "deadline:UpdateWorkerSchedule",
+				"deadline:DeleteWorker",
+			    "deadline:BatchGetJobEntity",
+			    "deadline:AssumeQueueRoleForWorker"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:PrincipalAccount": "\${aws:ResourceAccount}"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogStream"
+            ],
+            "Resource": "arn:aws:logs:*:*:*:/aws/deadline/*",
+            "Condition": {
+                "ForAnyValue:StringEquals": {
+                    "aws:CalledVia": [
+                        "deadline.amazonaws.com"
+                    ]
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:PutLogEvents",
+                "logs:GetLogEvents"
+            ],
+            "Resource": "arn:aws:logs:*:*:*:/aws/deadline/*"
+        }
+    ]
+}
+EOF
+)
+
+aws iam put-role-policy --role-name "$FLEET_SERVICE_ROLE_NAME" --policy-name "${FLEET_SERVICE_ROLE_NAME}-Policy" --policy-document "$FLEET_POLICY" --output text > /dev/null
+check_error "Failed to attach policy to $FLEET_SERVICE_ROLE_NAME"
+
+
+# =============================================================================
+# STEP 4: Create IAM role for AWSDeadlineCloudMonitorUserRole
+# =============================================================================
+echo "Creating and attaching policy for $MONITOR_USER_ROLE_NAME..."
+
+aws iam create-role --role-name "$MONITOR_USER_ROLE_NAME" --assume-role-policy-document "$MONITOR_TRUST_POLICY" --output text > /dev/null
+check_error "Failed to create IAM role: $MONITOR_USER_ROLE_NAME"
+
+# Note: The 'deadline:RequesterPrincipalId' condition is populated with the dynamically found ID.
+MONITOR_POLICY=$(cat <<EOF
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Effect": "Allow",
+			"Action": [
+				"identitystore:DescribeGroup",
+				"identitystore:DescribeUser",
+				"identitystore:ListGroupMembershipsForMember",
+				"ec2:DescribeInstanceTypes",
+				"identitystore:ListUsers",
+				"deadline:GetApplicationVersion"
+			],
+			"Resource": [
+				"*"
+			]
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssociateMemberToFarm",
+				"deadline:AssociateMemberToFleet",
+				"deadline:AssociateMemberToJob",
+				"deadline:AssociateMemberToQueue",
+				"deadline:CreateBudget",
+				"deadline:DeleteBudget",
+				"deadline:DisassociateMemberFromFarm",
+				"deadline:DisassociateMemberFromFleet",
+				"deadline:DisassociateMemberFromJob",
+				"deadline:DisassociateMemberFromQueue",
+				"deadline:GetAggregatedStatisticsForSessions",
+				"deadline:GetBudget",
+				"deadline:GetSessionsStatisticsAggregation",
+				"deadline:ListBudgets",
+				"deadline:StartSessionsStatisticsAggregation",
+				"deadline:UpdateBudget"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FarmMembershipLevels": [
+						"OWNER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssociateMemberToFarm",
+				"deadline:AssociateMemberToFleet",
+				"deadline:AssociateMemberToJob",
+				"deadline:AssociateMemberToQueue"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FarmMembershipLevels": [
+						"MANAGER"
+					]
+				},
+				"StringEquals": {
+					"deadline:AssociatedMembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER",
+						""
+					],
+					"deadline:MembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:DisassociateMemberFromFarm",
+				"deadline:DisassociateMemberFromFleet",
+				"deadline:DisassociateMemberFromJob",
+				"deadline:DisassociateMemberFromQueue"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FarmMembershipLevels": [
+						"MANAGER"
+					]
+				},
+				"StringEquals": {
+					"deadline:AssociatedMembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER",
+						""
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListFarmMembers",
+				"deadline:ListFleetMembers",
+				"deadline:ListJobMembers",
+				"deadline:ListQueueMembers",
+				"deadline:UpdateJob",
+				"deadline:UpdateSession",
+				"deadline:UpdateStep",
+				"deadline:UpdateTask"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FarmMembershipLevels": [
+						"OWNER",
+						"MANAGER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssumeQueueRoleForUser",
+				"deadline:CreateJob"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FarmMembershipLevels": [
+						"OWNER",
+						"MANAGER",
+						"CONTRIBUTOR"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssumeFleetRoleForRead",
+				"deadline:AssumeQueueRoleForRead",
+				"deadline:GetFarm",
+				"deadline:GetFleet",
+				"deadline:GetJob",
+				"deadline:GetQueue",
+				"deadline:GetQueueEnvironment",
+				"deadline:GetQueueFleetAssociation",
+				"deadline:GetSession",
+				"deadline:GetSessionAction",
+				"deadline:GetStep",
+				"deadline:GetStorageProfile",
+				"deadline:GetStorageProfileForQueue",
+				"deadline:GetTask",
+				"deadline:GetWorker",
+				"deadline:ListQueueEnvironments",
+				"deadline:ListQueueFleetAssociations",
+				"deadline:ListSessionActions",
+				"deadline:ListSessions",
+				"deadline:ListSessionsForWorker",
+				"deadline:ListStepConsumers",
+				"deadline:ListStepDependencies",
+				"deadline:ListSteps",
+				"deadline:ListStorageProfiles",
+				"deadline:ListStorageProfilesForQueue",
+				"deadline:ListTasks",
+				"deadline:ListWorkers",
+				"deadline:SearchJobs",
+				"deadline:SearchSteps",
+				"deadline:SearchTasks",
+				"deadline:SearchWorkers"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FarmMembershipLevels": [
+						"OWNER",
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListFleets",
+				"deadline:ListJobs",
+				"deadline:ListQueues"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"StringEquals": {
+					"deadline:RequesterPrincipalId": "$DEADLINE_PRINCIPAL_ID"
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListFarms"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"StringEquals": {
+					"deadline:RequesterPrincipalId": "$DEADLINE_PRINCIPAL_ID"
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"identitystore:DescribeGroup",
+				"identitystore:DescribeUser",
+				"identitystore:ListGroupMembershipsForMember",
+				"ec2:DescribeInstanceTypes",
+				"identitystore:ListUsers",
+				"deadline:GetApplicationVersion"
+			],
+			"Resource": [
+				"*"
+			]
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssociateMemberToFleet",
+				"deadline:DisassociateMemberFromFleet"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FleetMembershipLevels": [
+						"OWNER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssociateMemberToFleet"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FleetMembershipLevels": [
+						"MANAGER"
+					]
+				},
+				"StringEquals": {
+					"deadline:AssociatedMembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER",
+						""
+					],
+					"deadline:MembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:DisassociateMemberFromFleet"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FleetMembershipLevels": [
+						"MANAGER"
+					]
+				},
+				"StringEquals": {
+					"deadline:AssociatedMembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER",
+						""
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListFleetMembers"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FleetMembershipLevels": [
+						"OWNER",
+						"MANAGER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssumeFleetRoleForRead",
+				"deadline:CreateQueueFleetAssociation",
+				"deadline:DeleteQueueFleetAssociation",
+				"deadline:GetFleet",
+				"deadline:GetQueueFleetAssociation",
+				"deadline:GetWorker",
+				"deadline:ListQueueFleetAssociations",
+				"deadline:ListSessionsForWorker",
+				"deadline:ListWorkers",
+				"deadline:SearchWorkers",
+				"deadline:UpdateQueueFleetAssociation"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:FleetMembershipLevels": [
+						"OWNER",
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListFleets"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"StringEquals": {
+					"deadline:RequesterPrincipalId": "$DEADLINE_PRINCIPAL_ID"
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"identitystore:DescribeGroup",
+				"identitystore:DescribeUser",
+				"identitystore:ListGroupMembershipsForMember",
+				"ec2:DescribeInstanceTypes",
+				"identitystore:ListUsers",
+				"deadline:GetApplicationVersion"
+			],
+			"Resource": [
+				"*"
+			]
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssociateMemberToJob",
+				"deadline:DisassociateMemberFromJob"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:JobMembershipLevels": [
+						"OWNER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssociateMemberToJob"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:JobMembershipLevels": [
+						"MANAGER"
+					]
+				},
+				"StringEquals": {
+					"deadline:AssociatedMembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER",
+						""
+					],
+					"deadline:MembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:DisassociateMemberFromJob"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:JobMembershipLevels": [
+						"MANAGER"
+					]
+				},
+				"StringEquals": {
+					"deadline:AssociatedMembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER",
+						""
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListJobMembers",
+				"deadline:UpdateJob",
+				"deadline:UpdateSession",
+				"deadline:UpdateStep",
+				"deadline:UpdateTask"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:JobMembershipLevels": [
+						"OWNER",
+						"MANAGER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:GetJob",
+				"deadline:GetSession",
+				"deadline:GetSessionAction",
+				"deadline:GetStep",
+				"deadline:GetTask",
+				"deadline:ListSessionActions",
+				"deadline:ListSessions",
+				"deadline:ListStepConsumers",
+				"deadline:ListStepDependencies",
+				"deadline:ListSteps",
+				"deadline:ListTasks",
+				"deadline:SearchSteps",
+				"deadline:SearchTasks"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:JobMembershipLevels": [
+						"OWNER",
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListJobs"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"StringEquals": {
+					"deadline:RequesterPrincipalId": "$DEADLINE_PRINCIPAL_ID"
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"identitystore:DescribeGroup",
+				"identitystore:DescribeUser",
+				"identitystore:ListGroupMembershipsForMember",
+				"ec2:DescribeInstanceTypes",
+				"identitystore:ListUsers",
+				"deadline:GetApplicationVersion"
+			],
+			"Resource": [
+				"*"
+			]
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssociateMemberToJob",
+				"deadline:AssociateMemberToQueue",
+				"deadline:DisassociateMemberFromJob",
+				"deadline:DisassociateMemberFromQueue"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:QueueMembershipLevels": [
+						"OWNER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssociateMemberToJob",
+				"deadline:AssociateMemberToQueue"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:QueueMembershipLevels": [
+						"MANAGER"
+					]
+				},
+				"StringEquals": {
+					"deadline:AssociatedMembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER",
+						""
+					],
+					"deadline:MembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:DisassociateMemberFromJob",
+				"deadline:DisassociateMemberFromQueue"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:QueueMembershipLevels": [
+						"MANAGER"
+					]
+				},
+				"StringEquals": {
+					"deadline:AssociatedMembershipLevel": [
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER",
+						""
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListJobMembers",
+				"deadline:ListQueueMembers",
+				"deadline:UpdateJob",
+				"deadline:UpdateSession",
+				"deadline:UpdateStep",
+				"deadline:UpdateTask"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:QueueMembershipLevels": [
+						"OWNER",
+						"MANAGER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssumeQueueRoleForUser",
+				"deadline:CreateJob"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:QueueMembershipLevels": [
+						"OWNER",
+						"MANAGER",
+						"CONTRIBUTOR"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:AssumeQueueRoleForRead",
+				"deadline:CreateQueueFleetAssociation",
+				"deadline:DeleteQueueFleetAssociation",
+				"deadline:GetJob",
+				"deadline:GetQueue",
+				"deadline:GetQueueEnvironment",
+				"deadline:GetQueueFleetAssociation",
+				"deadline:GetSession",
+				"deadline:GetSessionAction",
+				"deadline:GetStep",
+				"deadline:GetStorageProfileForQueue",
+				"deadline:GetTask",
+				"deadline:ListQueueEnvironments",
+				"deadline:ListQueueFleetAssociations",
+				"deadline:ListSessionActions",
+				"deadline:ListSessions",
+				"deadline:ListStepConsumers",
+				"deadline:ListStepDependencies",
+				"deadline:ListSteps",
+				"deadline:ListStorageProfilesForQueue",
+				"deadline:ListTasks",
+				"deadline:SearchJobs",
+				"deadline:SearchSteps",
+				"deadline:SearchTasks",
+				"deadline:UpdateQueueFleetAssociation"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"deadline:QueueMembershipLevels": [
+						"OWNER",
+						"MANAGER",
+						"CONTRIBUTOR",
+						"VIEWER"
+					]
+				}
+			}
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"deadline:ListJobs",
+				"deadline:ListQueues"
+			],
+			"Resource": [
+				"*"
+			],
+			"Condition": {
+				"StringEquals": {
+					"deadline:RequesterPrincipalId": "$DEADLINE_PRINCIPAL_ID"
+				}
+			}
+		}
+	]
+}
+EOF
+)
+
+aws iam put-role-policy --role-name "$MONITOR_USER_ROLE_NAME" --policy-name "${MONITOR_USER_ROLE_NAME}-Policy" --policy-document "$MONITOR_POLICY" --output text > /dev/null
+check_error "Failed to attach policy to $MONITOR_USER_ROLE_NAME"
+
+echo "IAM Roles created successfully."
+echo "Waiting for Role Updates for  5 seconds"
+sleep 5
+
+# =============================================================================
+# STEP 5: Create a Deadline Cloud Farm Queue
+# =============================================================================
+#    --role-arn "$QUEUE_ROLE_ARN" \
+
+echo "Creating Deadline Cloud queue..."
+
+echo "aws deadline create-queue \
+    --farm-id "$DEADLINE_CLOUD_FARM_ID" \
+    --display-name "$DEADLINE_CLOUD_FARM_NAME" \
+    --region "$AWS_REGION" \
+	--role-arn "$QUEUE_ROLE_ARN" \
+    --profile "$AWS_PROFILE" "
+
+QUEUE_OUTPUT=$(aws deadline create-queue \
+    --farm-id "$DEADLINE_CLOUD_FARM_ID" \
+    --display-name "$DEADLINE_CLOUD_FARM_NAME" \
+    --region "$AWS_REGION" \
+	--role-arn "$QUEUE_ROLE_ARN" \
+    --profile "$AWS_PROFILE")
+check_error "Failed to create Deadline Cloud queue"
+export DEADLINE_CLOUD_QUEUE_ID=$(echo "$QUEUE_OUTPUT" | jq -r '.queueId')
+echo "Deadline Cloud queue created with ID: $DEADLINE_CLOUD_QUEUE_ID"
+
+# =============================================================================
+# STEP 6: Create an AWS Deadline Service Managed Fleet
+# =============================================================================
+echo "Creating AWS Deadline Service Managed Fleet: $DEADLINE_FLEET_DISPLAY_NAME"
+
+
+echo "aws deadline create-fleet \
+    --farm-id "$DEADLINE_CLOUD_FARM_ID" \
+    --display-name "$DEADLINE_FLEET_DISPLAY_NAME" \
+    --role-arn "$FLEET_ROLE_ARN" \
+    --max-worker-count "$MAX_WORKER_COUNT" \
+    --configuration "file://$FLEET_CONFIG_FILE" \
+    --region "$AWS_REGION" \
+    --profile "$AWS_PROFILE" "
+
+
+FLEET_OUTPUT=$(aws deadline create-fleet \
+    --farm-id "$DEADLINE_CLOUD_FARM_ID" \
+    --display-name "$DEADLINE_FLEET_DISPLAY_NAME" \
+    --role-arn "$FLEET_ROLE_ARN" \
+    --max-worker-count "$MAX_WORKER_COUNT" \
+    --configuration "file://$FLEET_CONFIG_FILE" \
+    --region "$AWS_REGION" \
+    --profile "$AWS_PROFILE")
+check_error "Failed to create AWS Deadline Service Managed Fleet"
+export DEADLINE_CLOUD_FLEET_ID=$(echo "$FLEET_OUTPUT" | jq -r '.fleetId')
+echo "Deadline Cloud fleet created with ID: $DEADLINE_CLOUD_FLEET_ID"
+
+# =============================================================================
+# STEP 7: Associate Queue to a Deadline Cloud Fleet
+# =============================================================================
+echo "Associating queue $DEADLINE_CLOUD_QUEUE_ID with fleet $DEADLINE_CLOUD_FLEET_ID..."
+aws deadline create-queue-fleet-association \
+    --farm-id "$DEADLINE_CLOUD_FARM_ID" \
+    --queue-id "$DEADLINE_CLOUD_QUEUE_ID" \
+    --fleet-id "$DEADLINE_CLOUD_FLEET_ID" \
+    --region "$AWS_REGION" \
+    --profile "$AWS_PROFILE" > /dev/null
+check_error "Failed to associate queue with fleet"
+echo "Queue and fleet associated successfully."
+
+echo "Script completed successfully."
+echo "Farm ID: $DEADLINE_CLOUD_FARM_ID"
+echo "Queue ID: $DEADLINE_CLOUD_QUEUE_ID"
+echo "Fleet ID: $DEADLINE_CLOUD_FLEET_ID"
