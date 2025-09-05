@@ -21,17 +21,17 @@ set -e
 # USER CONFIGURATION
 # =============================================================================
 export AWS_REGION="us-east-1"
-export AWS_PROFILE="kj-aws"
+export AWS_PROFILE="aws-profile-name"
+export AWS_ACCOUNT_ID=833740154547
 export S3_BUCKET="kj-aws-test-deadline-cloud-storage-bucket"
 export CREATE_S3_BUCKET="true"
-export DEADLINE_CLOUD_FARM_NAME="kj-aws-test-my-deadline-farm"
-export QUEUE_SERVICE_ROLE_NAME="kj-aws-test-DeadlineCloud-Queue-Service-Role-3"
-export FLEET_SERVICE_ROLE_NAME="kj-aws-test-DeadlineCloud-Fleet-Service-Role-3"
-export MONITOR_USER_ROLE_NAME="kj-aws-test-AWSDeadlineCloudMonitorUserRole-3"
+export DEADLINE_CLOUD_FARM_NAME="bucketname-aws-test-my-deadline-farm"
+export QUEUE_SERVICE_ROLE_NAME="bucketname-aws-test-DeadlineCloud-Queue-Service-Role-3"
+export FLEET_SERVICE_ROLE_NAME="bucketname-aws-test-DeadlineCloud-Fleet-Service-Role-3"
+export MONITOR_USER_ROLE_NAME="bucketname-aws-test-AWSDeadlineCloudMonitorUserRole-3"
 export DEADLINE_FLEET_DISPLAY_NAME="my-deadline-fleet"
 export MAX_WORKER_COUNT=5
 export FLEET_CONFIG_FILE="service-managed-fleet-config.json"
-export PRINCIPAL_ID_ARN="arn:aws:iam::833740154547:user/envoi-services"
 
 # =============================================================================
 # DYNAMIC VARIABLES (DO NOT MODIFY)
